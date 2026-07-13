@@ -27,7 +27,7 @@ public class OpenBerlinU2ExtensionScenario extends OpenBerlinScenario {
 
 	private static final Logger log = LogManager.getLogger(OpenBerlinU2ExtensionScenario.class);
 
-	// List of new stations, from existing line end outwards
+	// List of new stations with runtimes including stop times in seconds, from existing line end outwards
 	private static final List<ExtensionStop> U2_EXTENSION = List.of(
 		new ExtensionStop(
 			"U Pankow Kirche",
@@ -60,6 +60,7 @@ public class OpenBerlinU2ExtensionScenario extends OpenBerlinScenario {
 	@Override
 	protected Config prepareConfig(Config config) {
 		config = super.prepareConfig(config);
+		// append "u2-extension" to the end of the run output folder, this avoids collision with the base case without writing a new config
 		addRunOption(config, "u2-extension");
 		return config;
 	}
@@ -77,11 +78,19 @@ public class OpenBerlinU2ExtensionScenario extends OpenBerlinScenario {
 		validateSchedule();
 	}
 
+	/**
+	 * Find the U2 transitline in the schedule.
+	 *
+	 * @return The U2 Transit Line
+	 */
 	private TransitLine findU2Line() {
 		// be careful not to select the U2 replacement bus Alexanderplatz <> Senefelderplatz, route type 402 is subway
 		return schedule.getTransitLines().values().stream().filter(l -> "U2".equals(l.getAttributes().getAttribute("gtfs_route_short_name")) && "402".equals(l.getAttributes().getAttribute("gtfs_route_type"))).findFirst().orElseThrow();
 	}
 
+	/**
+	 * Build the PT network extension from S+U Pankow to the new end station.
+	 */
 	private void buildNetworkExtension() {
 		// save U2 terminus loop link and existing link as template
 		TransitStopFacility pankow = schedule.getFacilities().get(Id.create("351543_subway", TransitStopFacility.class));
@@ -107,17 +116,11 @@ public class OpenBerlinU2ExtensionScenario extends OpenBerlinScenario {
 			newStops.add(facility);
 
 			// add link to the new stop...
-			Link linkTo = network.getFactory().createLink(Id.createLinkId(prevNode.getId() + "-" + node.getId()), prevNode, node);
-			copyLinkProperties(linkTemplate, linkTo);
-			linkTo.setLength(NetworkUtils.getEuclideanDistance(prevNode.getCoord(), stop.coord));
-			network.addLink(linkTo);
+			Link linkTo = addConnector(linkTemplate, prevNode, node);
 			outboundLinks.add(linkTo.getId());
 
 			// ...and link back to the previous stop...
-			Link linkFrom = network.getFactory().createLink(Id.createLinkId(node.getId() + "-" + prevNode.getId()), node, prevNode);
-			copyLinkProperties(linkTemplate, linkFrom);
-			linkFrom.setLength(NetworkUtils.getEuclideanDistance(prevNode.getCoord(), stop.coord));
-			network.addLink(linkFrom);
+			Link linkFrom = addConnector(linkTemplate, node, prevNode);
 			inboundLinks.addFirst(linkFrom.getId());
 
 			// ...and finally add a loop linking the new stop to itself
@@ -132,6 +135,13 @@ public class OpenBerlinU2ExtensionScenario extends OpenBerlinScenario {
 		}
 	}
 
+	/**
+	 * Extend the U2 transit line routes from S+U Pankow to the new end station.
+	 * The departure times of the existing routes are unchanged, the new departures
+	 * are appended/prepended with earlier/later departure times respectively.
+	 *
+	 * @param u2 The U2 Transit Line
+	 */
 	private void extendRoutes(TransitLine u2) {
 		double offset = U2_EXTENSION.stream().mapToDouble(s -> s.runTimeFromPrevious).sum();
 		TransitStopFacility pankow = schedule.getFacilities().get(Id.create("351543_subway", TransitStopFacility.class));
@@ -144,7 +154,6 @@ public class OpenBerlinU2ExtensionScenario extends OpenBerlinScenario {
 			if (!endsAtPankow && !startsAtPankow) {
 				continue;
 			}
-
 
 			List<Id<Link>> links = new ArrayList<>();
 			links.add(oldRoute.getRoute().getStartLinkId());
@@ -160,7 +169,7 @@ public class OpenBerlinU2ExtensionScenario extends OpenBerlinScenario {
 				for (int i = 0; i < U2_EXTENSION.size(); i++) {
 					ExtensionStop stop = U2_EXTENSION.get(i);
 
-					// ...and add the new stop with the correct offset
+					// ...and add the new stops with the correct offset
 					accumulatedRunTime += stop.runTimeFromPrevious;
 					stops.add(newStop(newStops.get(i), accumulatedRunTime));
 
@@ -184,7 +193,10 @@ public class OpenBerlinU2ExtensionScenario extends OpenBerlinScenario {
 			TransitRoute newRoute = schedule.getFactory().createTransitRoute(oldRoute.getId(), RouteUtils.createNetworkRoute(links), stops, oldRoute.getTransportMode());
 			AttributesUtils.copyAttributesFromTo(oldRoute, newRoute);
 			for (Departure dep : oldRoute.getDepartures().values()) {
-				// if we start at Pankow, move departure at Pankow Kirche earlier according to our offset
+				/* If the route starts at Pankow, move departure at the new start station earlier according to the total offset.
+				 * This here is the initial departure, of which only one exists for each train run; all further stations get
+				 * their departure automatically from the stop offset times defined in the route. Subtracting the accumulated
+				 * offset of the newly added stations keeps the running times at all existing stations the same (transfers!). */
 				Departure newDep = schedule.getFactory().createDeparture(dep.getId(), dep.getDepartureTime() - (startsAtPankow ? offset : 0.0));
 				newDep.setVehicleId(dep.getVehicleId());
 				newRoute.addDeparture(newDep);
@@ -197,6 +209,9 @@ public class OpenBerlinU2ExtensionScenario extends OpenBerlinScenario {
 		}
 	}
 
+	/**
+	 * Validate the transit schedule after the U2 extension.
+	 */
 	private void validateSchedule() {
 		TransitScheduleValidator.ValidationResult validationResult = TransitScheduleValidator.validateAll(schedule, network);
 		if (!validationResult.isValid()) {
@@ -207,6 +222,28 @@ public class OpenBerlinU2ExtensionScenario extends OpenBerlinScenario {
 		}
 	}
 
+	/**
+	 * Create a connector between two PT nodes.
+	 *
+	 * @param template Link template to use for the connector
+	 * @param from     Start node
+	 * @param to       End node
+	 * @return The created connector link
+	 */
+	private Link addConnector(Link template, Node from, Node to) {
+		Link connector = network.getFactory().createLink(Id.createLinkId(from.getId() + "-" + to.getId()), from, to);
+		copyLinkProperties(template, connector);
+		connector.setLength(NetworkUtils.getEuclideanDistance(from.getCoord(), to.getCoord()));
+		network.addLink(connector);
+		return connector;
+	}
+
+	/**
+	 * Copy link properties from one link to another.
+	 *
+	 * @param template Link to copy properties from
+	 * @param target   Link to copy properties to
+	 */
 	private static void copyLinkProperties(Link template, Link target) {
 		target.setLength(template.getLength());
 		target.setFreespeed(template.getFreespeed());
@@ -215,12 +252,26 @@ public class OpenBerlinU2ExtensionScenario extends OpenBerlinScenario {
 		target.setAllowedModes(template.getAllowedModes());
 	}
 
+	/**
+	 * Copy a stop with a time offset.
+	 *
+	 * @param s     Stop to copy
+	 * @param shift Arrival/departure time offset in seconds
+	 * @return Copied stop
+	 */
 	private TransitRouteStop copyStop(TransitRouteStop s, double shift) {
 		TransitRouteStop copy = schedule.getFactory().createTransitRouteStop(s.getStopFacility(), s.getArrivalOffset().seconds() + shift, s.getDepartureOffset().seconds() + shift);
 		copy.setAwaitDepartureTime(s.isAwaitDepartureTime());
 		return copy;
 	}
 
+	/**
+	 * Create a new stop with a time offset.
+	 *
+	 * @param facility The Stop Facility to link to
+	 * @param offset   Arrival/departure time offset in seconds
+	 * @return The created stop
+	 */
 	private TransitRouteStop newStop(TransitStopFacility facility, double offset) {
 		TransitRouteStop stop = schedule.getFactory().createTransitRouteStop(facility, offset, offset);
 		stop.setAwaitDepartureTime(true);
